@@ -12,6 +12,7 @@ from datetime import datetime, timezone, timedelta
 import asyncio
 import json
 import hashlib
+import re
 
 # Load env
 ROOT_DIR = Path(__file__).parent
@@ -148,6 +149,29 @@ def fallback_embed(text: str, dim: int = 64) -> List[float]:
             if len(vals) >= dim:
                 break
     return vals
+
+# Relaxed JSON extractor for LLM responses
+_json_block_re = re.compile(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", re.IGNORECASE)
+
+def parse_json_relaxed(content: str) -> Dict[str, Any]:
+    if not content:
+        return {}
+    # Try fenced block first
+    m = _json_block_re.search(content)
+    if m:
+        try:
+            return json.loads(m.group(1))
+        except Exception:
+            pass
+    # Fallback: find first { ... } block
+    start = content.find("{")
+    end = content.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        try:
+            return json.loads(content[start:end+1])
+        except Exception:
+            return {}
+    return {}
 
 # ----- Basic health/root -----
 @api.get("/")
@@ -372,41 +396,87 @@ async def compute_anomalies(contamination: float = Query(default=0.05, gt=0.0, l
 DATA_SOURCE = os.environ.get('DATA_SOURCE', 'coingecko')
 CG_KEY = os.environ.get('COINGECKO_API_KEY')
 _last_candle_ts: Optional[int] = None
+_ingest_backoff: int = 60
 
-async def fetch_latest_candle():
+async def fetch_latest_candle_coingecko() -> bool:
     import httpx
-    global _last_candle_ts
     try:
-        if DATA_SOURCE == 'coingecko':
-            if CG_KEY:
-                base = "https://pro-api.coingecko.com/api/v3/coins/bitcoin/market_chart"
-                headers = {"x-cg-pro-api-key": CG_KEY}
-            else:
-                base = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart"
-                headers = {}
-            params = {"vs_currency": "usd", "days": "1", "interval": "minutely"}
-            async with httpx.AsyncClient(timeout=20) as hc:
-                r = await hc.get(base, params=params, headers=headers)
-                r.raise_for_status()
-                data = r.json()
-            prices = data.get("prices", [])
-            vols = data.get("total_volumes", [])
-            if not prices:
-                return
-            ts_ms, price = prices[-1]
-            vol = vols[-1][1] if vols else 0.0
-            candle = {
-                "ts": int(ts_ms // 1000),
-                "open": float(price),
-                "high": float(price),
-                "low": float(price),
-                "close": float(price),
-                "volume": float(vol),
-            }
-            await db.price_candles.update_one({"ts": candle["ts"]}, {"$set": candle}, upsert=True)
-            _last_candle_ts = candle["ts"]
+        if CG_KEY:
+            base = "https://pro-api.coingecko.com/api/v3/coins/bitcoin/market_chart"
+            headers = {"x-cg-pro-api-key": CG_KEY}
+        else:
+            base = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart"
+            headers = {}
+        params = {"vs_currency": "usd", "days": "1", "interval": "minutely"}
+        async with httpx.AsyncClient(timeout=20) as hc:
+            r = await hc.get(base, params=params, headers=headers)
+            r.raise_for_status()
+            data = r.json()
+        prices = data.get("prices", [])
+        vols = data.get("total_volumes", [])
+        if not prices:
+            return False
+        ts_ms, price = prices[-1]
+        vol = vols[-1][1] if vols else 0.0
+        candle = {
+            "ts": int(ts_ms // 1000),
+            "open": float(price),
+            "high": float(price),
+            "low": float(price),
+            "close": float(price),
+            "volume": float(vol),
+        }
+        await db.price_candles.update_one({"ts": candle["ts"]}, {"$set": candle}, upsert=True)
+        global _last_candle_ts
+        _last_candle_ts = candle["ts"]
+        return True
     except Exception as e:
-        logging.getLogger(__name__).warning(f"ingest error: {e}")
+        logging.getLogger(__name__).warning(f"ingest coingecko error: {e}")
+        return False
+
+async def fetch_latest_candle_binance() -> bool:
+    import httpx
+    try:
+        # 1 latest 1m kline for BTCUSDT
+        url = "https://api.binance.com/api/v3/klines"
+        params = {"symbol": "BTCUSDT", "interval": "1m", "limit": 1}
+        async with httpx.AsyncClient(timeout=20) as hc:
+            r = await hc.get(url, params=params)
+            r.raise_for_status()
+            data = r.json()
+        if not data:
+            return False
+        k = data[0]
+        open_time = int(k[0] // 1000)
+        open_p = float(k[1])
+        high_p = float(k[2])
+        low_p = float(k[3])
+        close_p = float(k[4])
+        volume = float(k[5])
+        candle = {"ts": open_time, "open": open_p, "high": high_p, "low": low_p, "close": close_p, "volume": volume}
+        await db.price_candles.update_one({"ts": candle["ts"]}, {"$set": candle}, upsert=True)
+        global _last_candle_ts
+        _last_candle_ts = candle["ts"]
+        return True
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"ingest binance error: {e}")
+        return False
+
+async def fetch_latest_candle() -> bool:
+    # Try configured source first, fall back if allowed
+    source = DATA_SOURCE.lower()
+    success = False
+    if source in ("coingecko", "coingecko-only"):
+        success = await fetch_latest_candle_coingecko()
+        if not success and source != "coingecko-only":
+            success = await fetch_latest_candle_binance()
+    elif source == "binance":
+        success = await fetch_latest_candle_binance()
+    else:
+        success = await fetch_latest_candle_binance()
+        if not success:
+            success = await fetch_latest_candle_coingecko()
+    return success
 
 @api.get("/data/health")
 async def data_health():
@@ -414,6 +484,11 @@ async def data_health():
     age = (now - _last_candle_ts) if _last_candle_ts else None
     ok = age is not None and age < 180
     return {"source": DATA_SOURCE, "ok": bool(ok), "last_ts": _last_candle_ts, "age_sec": age}
+
+@api.post("/data/ingest_once")
+async def ingest_once():
+    ok = await fetch_latest_candle()
+    return {"ok": ok}
 
 @api.get("/candles/latest", response_model=Candle)
 async def candles_latest():
@@ -461,8 +536,8 @@ async def predict_once() -> Dict[str, Any]:
                 max_tokens=400,
             )
             content = resp.choices[0].message.content or "{}"
-            parsed = json.loads(content)
-            if isinstance(parsed, dict):
+            parsed = parse_json_relaxed(content)
+            if isinstance(parsed, dict) and parsed:
                 outputs = parsed
         except Exception as e:
             logging.getLogger(__name__).warning(f"prediction openai error: {e}")
@@ -531,16 +606,9 @@ async def graph_data():
     nodes = []
     links = []
 
-    # Projects
     for p in projects:
-        nodes.append({
-            "id": p["id"],
-            "type": "project",
-            "label": p["title"],
-            "status": p.get("status", "draft"),
-        })
+        nodes.append({"id": p["id"], "type": "project", "label": p["title"], "status": p.get("status", "draft")})
 
-    # Optional cluster nodes for reflections
     clusters = {}
     for r in reflections:
         if r.get("cluster") is not None:
@@ -548,37 +616,20 @@ async def graph_data():
             clusters[cid] = r['cluster']
 
     for cid, lab in clusters.items():
-        nodes.append({
-            "id": cid,
-            "type": "cluster",
-            "label": f"Cluster {lab}",
-        })
+        nodes.append({"id": cid, "type": "cluster", "label": f"Cluster {lab}"})
 
-    # Reflections
     for r in reflections:
         rid = r["id"]
-        nodes.append({
-            "id": rid,
-            "type": "reflection",
-            "label": (r.get("text", "")[:60] + ("…" if len(r.get("text", "")) > 60 else "")),
-        })
-        if projects:
-            links.append({"source": r["project_id"], "target": rid, "kind": "has_reflection", "weight": 1})
+        nodes.append({"id": rid, "type": "reflection", "label": (r.get("text", "")[:60] + ("…" if len(r.get("text", "")) > 60 else ""))})
+        links.append({"source": r["project_id"], "target": rid, "kind": "has_reflection", "weight": 1})
         if r.get("cluster") is not None:
             links.append({"source": rid, "target": f"cluster-{r['cluster']}", "kind": "in_cluster", "weight": 1})
 
-    # Anomalies
     for a in anomalies:
         aid = a["id"]
-        nodes.append({
-            "id": aid,
-            "type": "anomaly",
-            "label": a.get("severity", "low"),
-            "severity": a.get("severity", "low"),
-        })
+        nodes.append({"id": aid, "type": "anomaly", "label": a.get("severity", "low"), "severity": a.get("severity", "low")})
         links.append({"source": a["project_id"], "target": aid, "kind": "has_anomaly", "weight": 1})
 
-    # Predictions overlay: latest per horizon
     icon = {0: "↓", 1: "→", 2: "↑"}
     for pdoc in latest_preds:
         pid = f"pred-{pdoc['horizon']}-{pdoc.get('target_ts', 0)}"
@@ -590,12 +641,10 @@ async def graph_data():
             "sentiment": pdoc.get("sentiment", "neutral"),
             "confidence": pdoc.get("confidence", 0.0),
         })
-        # Attach prediction to the most recently updated project (if any)
         proj = await db.projects.find_one({}, sort=[("updated_at", -1)], projection={"_id": 0, "id": 1})
         if proj:
             links.append({"source": proj["id"], "target": pid, "kind": "has_prediction", "weight": 1})
 
-    # Simple score: reflections - anomalies (clamped)
     score = max(0, len(reflections) * 2 - len(anomalies))
 
     return {"nodes": nodes, "links": links, "stats": {"score": score, "projects": len(projects), "reflections": len(reflections), "anomalies": len(anomalies)}}
@@ -616,9 +665,14 @@ async def _auto_reflect_once():
     SCHED_NEXT = (datetime.now(timezone.utc) + timedelta(hours=SCHEDULE_HOURS)).isoformat()
 
 async def _tick_ingest():
+    global _ingest_backoff
     while True:
-        await fetch_latest_candle()
-        await asyncio.sleep(60)
+        ok = await fetch_latest_candle()
+        if not ok:
+            _ingest_backoff = min(300, _ingest_backoff + 30)  # backoff up to 5 minutes
+        else:
+            _ingest_backoff = 60
+        await asyncio.sleep(_ingest_backoff)
 
 async def _schedule_predictions():
     global PRED_NEXT
