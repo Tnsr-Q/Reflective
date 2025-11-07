@@ -563,7 +563,7 @@ async def graph_data():
             "label": (r.get("text", "")[:60] + ("…" if len(r.get("text", "")) > 60 else "")),
         })
         if projects:
-            links.append({"source": projects[-1]["id"], "target": rid, "kind": "has_reflection", "weight": 1})
+            links.append({"source": r["project_id"], "target": rid, "kind": "has_reflection", "weight": 1})
         if r.get("cluster") is not None:
             links.append({"source": rid, "target": f"cluster-{r['cluster']}", "kind": "in_cluster", "weight": 1})
 
