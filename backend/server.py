@@ -368,99 +368,7 @@ async def compute_anomalies(contamination: float = Query(default=0.05, gt=0.0, l
 
     return {"flagged": flagged}
 
-# ----- Graph endpoint (for D3 force-graph) -----
-@api.get("/graph")
-async def graph_data():
-    projects = await db.projects.find({}, {"_id": 0}).to_list(1000)
-    reflections = await db.reflections.find({}, {"_id": 0}).to_list(5000)
-    anomalies = await db.anomalies.find({}, {"_id": 0}).to_list(5000)
-
-    nodes = []
-    links = []
-
-    # Projects
-    for p in projects:
-        nodes.append({
-            "id": p["id"],
-            "type": "project",
-            "label": p["title"],
-            "status": p.get("status", "draft"),
-        })
-
-    # Optional cluster nodes
-    clusters = {}
-    for r in reflections:
-        if r.get("cluster") is not None:
-            cid = f"cluster-{r['cluster']}"
-            clusters[cid] = r['cluster']
-
-    for cid, lab in clusters.items():
-        nodes.append({
-            "id": cid,
-            "type": "cluster",
-            "label": f"Cluster {lab}",
-        })
-
-    # Reflections
-    for r in reflections:
-        rid = r["id"]
-        nodes.append({
-            "id": rid,
-            "type": "reflection",
-            "label": (r.get("text", "")[:60] + ("…" if len(r.get("text", "")) > 60 else "")),
-        })
-        links.append({"source": r["project_id"], "target": rid, "kind": "has_reflection"})
-        if r.get("cluster") is not None:
-            links.append({"source": rid, "target": f"cluster-{r['cluster']}", "kind": "in_cluster", "weight": 1})
-
-    # Anomalies
-    for a in anomalies:
-        aid = a["id"]
-        nodes.append({
-            "id": aid,
-            "type": "anomaly",
-            "label": a.get("severity", "low"),
-            "severity": a.get("severity", "low"),
-        })
-        links.append({"source": a["project_id"], "target": aid, "kind": "has_anomaly", "weight": 1})
-
-    # Simple score: reflections - anomalies (clamped)
-    score = max(0, len(reflections) * 2 - len(anomalies))
-
-    return {"nodes": nodes, "links": links, "stats": {"score": score, "projects": len(projects), "reflections": len(reflections), "anomalies": len(anomalies)}}
-
-@api.post("/images/generate", response_model=ImageResponse)
-async def generate_image(payload: ImageRequest):
-    client_ai = get_openai_client()
-    try:
-        result = await client_ai.images.generate(
-            model="gpt-image-1",
-            prompt=payload.prompt,
-            size=payload.size,
-            quality=payload.quality,
-        )
-        url = result.data[0].url  # type: ignore[attr-defined]
-        return ImageResponse(url=url)
-    except Exception as e:
-        logging.getLogger(__name__).warning(f"Image generation failed: {e}")
-        return ImageResponse(url="https://placehold.co/512x512/png?text=AI+Image+error")
-
-# ----- AI health -----
-@api.get("/ai/health", response_model=AIHealth)
-async def ai_health():
-    if not OPENAI_KEY:
-        return AIHealth(ok=False, reason="missing_key")
-    try:
-        client_ai = get_openai_client()
-        await client_ai.embeddings.create(model=OPENAI_EMBED_MODEL, input="ok")
-        return AIHealth(ok=True)
-    except Exception as e:
-        msg = str(e).lower()
-        if "401" in msg or "unauthorized" in msg or "invalid_api_key" in msg:
-            return AIHealth(ok=False, reason="unauthorized")
-        return AIHealth(ok=False, reason="error")
-
-# ----- Live data ingestion (CoinGecko free/pro) -----
+# ----- Ticker and price data -----
 DATA_SOURCE = os.environ.get('DATA_SOURCE', 'coingecko')
 CG_KEY = os.environ.get('COINGECKO_API_KEY')
 _last_candle_ts: Optional[int] = None
@@ -497,9 +405,6 @@ async def fetch_latest_candle():
             }
             await db.price_candles.update_one({"ts": candle["ts"]}, {"$set": candle}, upsert=True)
             _last_candle_ts = candle["ts"]
-        else:
-            # Extend for other sources later
-            pass
     except Exception as e:
         logging.getLogger(__name__).warning(f"ingest error: {e}")
 
@@ -522,7 +427,6 @@ async def ticker():
     latest = await db.price_candles.find_one({}, sort=[("ts", -1)], projection={"_id": 0})
     if not latest:
         raise HTTPException(status_code=404, detail="No candles yet")
-    # compute 24h change if we have old candle
     target_ts = latest["ts"] - 86400
     past = await db.price_candles.find_one({"ts": {"$lte": target_ts}}, sort=[("ts", -1)], projection={"_id": 0})
     change_pct = 0.0
@@ -534,13 +438,10 @@ async def ticker():
 HORIZONS: List[tuple[str, int]] = [("1h", 60), ("4h", 240), ("8h", 480), ("24h", 1440), ("3d", 4320), ("2w", 20160), ("1m", 43200)]
 
 async def predict_once() -> Dict[str, Any]:
-    # Pull last 60 min candles
     cutoff = int(datetime.now(timezone.utc).timestamp()) - 60 * 60
     candles = await db.price_candles.find({"ts": {"$gte": cutoff}}, {"_id": 0}).sort("ts", 1).to_list(200)
-    closes = [c["close"] for c in candles]
     now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
 
-    # Build prompt
     text_rows = "\n".join(f"{c['ts']}: {c['close']:.2f}" for c in candles[-60:])
     prompt = (
         "Given the last 60 one-minute BTC closes, output compact JSON with one entry per horizon: "
@@ -569,11 +470,9 @@ async def predict_once() -> Dict[str, Any]:
     else:
         used_fallback = True
 
-    # Fallback: all horizons 'same', conf 0, neutral
     if used_fallback or not outputs:
         outputs = {h: {"dir": 1, "conf": 0.0, "sent": "neutral", "explain": "fallback"} for (h, _) in HORIZONS}
 
-    # Persist predictions
     inserted = []
     for h, mins in HORIZONS:
         item = outputs.get(h) or {"dir": 1, "conf": 0.0, "sent": "neutral", "explain": "fallback"}
@@ -621,6 +520,85 @@ async def predictions_run():
     result = await predict_once()
     return result
 
+# ----- Graph endpoint (for D3 force-graph) -----
+@api.get("/graph")
+async def graph_data():
+    projects = await db.projects.find({}, {"_id": 0}).to_list(1000)
+    reflections = await db.reflections.find({}, {"_id": 0}).to_list(5000)
+    anomalies = await db.anomalies.find({}, {"_id": 0}).to_list(5000)
+    latest_preds = await predictions_latest()
+
+    nodes = []
+    links = []
+
+    # Projects
+    for p in projects:
+        nodes.append({
+            "id": p["id"],
+            "type": "project",
+            "label": p["title"],
+            "status": p.get("status", "draft"),
+        })
+
+    # Optional cluster nodes for reflections
+    clusters = {}
+    for r in reflections:
+        if r.get("cluster") is not None:
+            cid = f"cluster-{r['cluster']}"
+            clusters[cid] = r['cluster']
+
+    for cid, lab in clusters.items():
+        nodes.append({
+            "id": cid,
+            "type": "cluster",
+            "label": f"Cluster {lab}",
+        })
+
+    # Reflections
+    for r in reflections:
+        rid = r["id"]
+        nodes.append({
+            "id": rid,
+            "type": "reflection",
+            "label": (r.get("text", "")[:60] + ("…" if len(r.get("text", "")) > 60 else "")),
+        })
+        if projects:
+            links.append({"source": projects[-1]["id"], "target": rid, "kind": "has_reflection", "weight": 1})
+        if r.get("cluster") is not None:
+            links.append({"source": rid, "target": f"cluster-{r['cluster']}", "kind": "in_cluster", "weight": 1})
+
+    # Anomalies
+    for a in anomalies:
+        aid = a["id"]
+        nodes.append({
+            "id": aid,
+            "type": "anomaly",
+            "label": a.get("severity", "low"),
+            "severity": a.get("severity", "low"),
+        })
+        if projects:
+            links.append({"source": projects[-1]["id"], "target": aid, "kind": "has_anomaly", "weight": 1})
+
+    # Predictions overlay: latest per horizon
+    icon = {0: "↓", 1: "→", 2: "↑"}
+    for pdoc in latest_preds:
+        pid = f"pred-{pdoc['horizon']}-{pdoc.get('target_ts', 0)}"
+        label = f"{icon.get(int(pdoc.get('direction',1)), '→')} {pdoc['horizon']}"
+        nodes.append({
+            "id": pid,
+            "type": "prediction",
+            "label": label,
+            "sentiment": pdoc.get("sentiment", "neutral"),
+            "confidence": pdoc.get("confidence", 0.0),
+        })
+        if projects:
+            links.append({"source": projects[-1]["id"], "target": pid, "kind": "has_prediction", "weight": 1})
+
+    # Simple score: reflections - anomalies (clamped)
+    score = max(0, len(reflections) * 2 - len(anomalies))
+
+    return {"nodes": nodes, "links": links, "stats": {"score": score, "projects": len(projects), "reflections": len(reflections), "anomalies": len(anomalies)}}
+
 # ----- Reflection scheduler + ingest + predictions scheduling -----
 SCHEDULE_HOURS = float(os.environ.get('REFLECTION_SCHEDULE_HOURS', '4'))
 SCHED_NEXT: Optional[str] = None
@@ -644,7 +622,6 @@ async def _tick_ingest():
 async def _schedule_predictions():
     global PRED_NEXT
     while True:
-        # run on top of hour
         now = datetime.now(timezone.utc)
         next_top = (now + timedelta(hours=1)).replace(minute=0, second=5, microsecond=0)
         PRED_NEXT = next_top.isoformat()
@@ -660,18 +637,15 @@ async def scheduler_status():
 
 @app.on_event("startup")
 async def startup_tasks():
-    # indexes
     try:
         await db.price_candles.create_index("ts", unique=True)
         await db.predictions.create_index([("horizon", 1), ("created_at", -1)])
     except Exception as e:
         logging.getLogger(__name__).warning(f"index create error: {e}")
 
-    # start background loops (ingest + prediction + reflection via naive loops)
     try:
         asyncio.create_task(_tick_ingest())
         asyncio.create_task(_schedule_predictions())
-        # reflection next time seed
         global SCHED_NEXT
         SCHED_NEXT = (datetime.now(timezone.utc) + timedelta(seconds=10)).isoformat()
     except Exception as e:
