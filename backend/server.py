@@ -590,8 +590,10 @@ async def graph_data():
             "sentiment": pdoc.get("sentiment", "neutral"),
             "confidence": pdoc.get("confidence", 0.0),
         })
-        if projects:
-            links.append({"source": projects[-1]["id"], "target": pid, "kind": "has_prediction", "weight": 1})
+        # Attach prediction to the most recently updated project (if any)
+        proj = await db.projects.find_one({}, sort=[("updated_at", -1)], projection={"_id": 0, "id": 1})
+        if proj:
+            links.append({"source": proj["id"], "target": pid, "kind": "has_prediction", "weight": 1})
 
     # Simple score: reflections - anomalies (clamped)
     score = max(0, len(reflections) * 2 - len(anomalies))
