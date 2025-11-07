@@ -360,8 +360,8 @@ async def fetch_latest_candle_coingecko() -> bool:
             "volume": float(vol),
         }
         await db.price_candles.update_one({"ts": candle["ts"]}, {"$set": candle}, upsert=True)
-        global _last_candle_ts
-        _last_candle_ts = candle["ts"]
+        # update last candle ts
+        globals()["_last_candle_ts"] = candle["ts"]
         return True
     except Exception as e:
         logging.getLogger(__name__).warning(f"ingest coingecko error: {e}")
@@ -403,8 +403,8 @@ async def fetch_latest_candle_binance() -> bool:
         volume = float(k[5])
         candle = {"ts": open_time, "open": open_p, "high": high_p, "low": low_p, "close": close_p, "volume": volume}
         await db.price_candles.update_one({"ts": candle["ts"]}, {"$set": candle}, upsert=True)
-        global _last_candle_ts
-        _last_candle_ts = candle["ts"]
+        # update last candle ts
+        globals()["_last_candle_ts"] = candle["ts"]
         return True
     except Exception as e:
         logging.getLogger(__name__).warning(f"ingest binance error: {e}")
