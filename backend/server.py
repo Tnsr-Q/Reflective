@@ -195,7 +195,8 @@ async def create_reflection(payload: ReflectionCreate):
             )
             text = completion.choices[0].message.content or ""
         except Exception as e:
-            raise HTTPException(status_code=502, detail=f"OpenAI chat error: {e}")
+            # Fallback to a deterministic reflection if AI is unavailable (e.g., missing key or network)
+            text = f"Auto-reflection (fallback): Based on the prompt, focus on reducing overfitting, validating signals against multiple timeframes, and weighting volume/volatility to avoid chasing noise. Prompt: {payload.prompt[:180]}"
 
     # Generate embedding for text
     vector: List[float] = []
