@@ -8,7 +8,7 @@ from pathlib import Path
 from pydantic import BaseModel, Field, ConfigDict
 from typing import List, Optional, Literal, Dict, Any
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 # Load env
 ROOT_DIR = Path(__file__).parent
@@ -60,6 +60,7 @@ class Reflection(BaseModel):
     project_id: str
     text: str
     vector: List[float] = Field(default_factory=list)
+    cluster: Optional[int] = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 Severity = Literal['low', 'medium', 'high', 'critical']
@@ -74,6 +75,14 @@ class Anomaly(BaseModel):
     detail: str
     severity: Severity
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+class ImageRequest(BaseModel):
+    prompt: str = Field(min_length=1, max_length=800)
+    size: Optional[str] = Field(default="512x512")
+    quality: Optional[str] = Field(default="standard")
+
+class ImageResponse(BaseModel):
+    url: str
 
 # ----- OpenAI (via Emergent LLM key from env) -----
 OPENAI_KEY = os.environ.get('OPENAI_API_KEY')
@@ -102,6 +111,20 @@ async def serialize_dt(doc: Dict[str, Any]) -> Dict[str, Any]:
         if isinstance(v, datetime):
             out[k] = v.isoformat()
     return out
+
+# Simple deterministic pseudo-embedding as last-resort fallback
+import hashlib
+
+def fallback_embed(text: str, dim: int = 64) -> List[float]:
+    h = hashlib.sha256(text.encode("utf-8")).digest()
+    vals = []
+    # repeat hash to fill dim
+    while len(vals) < dim:
+        for b in h:
+            vals.append(((b / 255.0) * 2.0) - 1.0)
+            if len(vals) >= dim:
+                break
+    return vals
 
 # ----- Basic health/root -----
 @api.get("/")
@@ -136,7 +159,6 @@ async def create_project(payload: ProjectCreate):
 async def list_projects():
     docs = await db.projects.find({}, {"_id": 0}).to_list(1000)
     for d in docs:
-        # ensure datetimes
         for key in ("created_at", "updated_at"):
             if key in d and isinstance(d[key], str):
                 d[key] = datetime.fromisoformat(d[key])
@@ -162,7 +184,6 @@ async def update_project(project_id: str, payload: ProjectUpdate):
     if res.matched_count == 0:
         raise HTTPException(status_code=404, detail="Project not found")
     doc = await db.projects.find_one({"id": project_id}, {"_id": 0})
-    # cast dt
     for key in ("created_at", "updated_at"):
         if key in doc and isinstance(doc[key], str):
             doc[key] = datetime.fromisoformat(doc[key])
@@ -182,9 +203,9 @@ async def create_reflection(payload: ReflectionCreate):
         if not payload.prompt:
             raise HTTPException(status_code=400, detail="Provide either 'text' or 'prompt' to generate reflection")
         # Generate text via OpenAI chat
-        client = get_openai_client()
+        client_ai = get_openai_client()
         try:
-            completion = await client.chat.completions.create(
+            completion = await client_ai.chat.completions.create(
                 model=OPENAI_CHAT_MODEL,
                 messages=[
                     {"role": "system", "content": "You are a concise research assistant. Create a short self-reflection (2-4 sentences) about the project context for market reasoning."},
@@ -201,17 +222,16 @@ async def create_reflection(payload: ReflectionCreate):
     # Generate embedding for text
     vector: List[float] = []
     try:
-        client = get_openai_client()
-        emb = await client.embeddings.create(
-            model=OPENAI_EMBED_MODEL,
-            input=text,
-            encoding_format="float",
-        )
-        vector = emb.data[0].embedding  # type: ignore
+      client_ai = get_openai_client()
+      emb = await client_ai.embeddings.create(
+          model=OPENAI_EMBED_MODEL,
+          input=text,
+          encoding_format="float",
+      )
+      vector = emb.data[0].embedding  # type: ignore
     except Exception as e:
-        # Still allow save without vector
-        logging.getLogger(__name__).warning(f"Embedding generation failed: {e}")
-        vector = []
+      logging.getLogger(__name__).warning(f"Embedding generation failed: {e}")
+      vector = fallback_embed(text)
 
     ref = Reflection(project_id=payload.project_id, text=text, vector=vector)
     doc = await serialize_dt(ref.model_dump())
@@ -248,15 +268,6 @@ async def create_anomaly(payload: AnomalyCreate):
     return an
 
 @api.get("/anomalies", response_model=List[Anomaly])
-
-class ImageRequest(BaseModel):
-    prompt: str = Field(min_length=1, max_length=800)
-    size: Optional[str] = Field(default="512x512")
-    quality: Optional[str] = Field(default="standard")
-
-class ImageResponse(BaseModel):
-    url: str
-
 async def list_anomalies(project_id: Optional[str] = Query(default=None)):
     filt = {"project_id": project_id} if project_id else {}
     docs = await db.anomalies.find(filt, {"_id": 0}).sort("created_at", -1).to_list(1000)
@@ -264,6 +275,88 @@ async def list_anomalies(project_id: Optional[str] = Query(default=None)):
         if isinstance(d.get('created_at'), str):
             d['created_at'] = datetime.fromisoformat(d['created_at'])
     return docs
+
+# ----- Compute: Clustering & Surprise Detection -----
+@api.post("/compute/clusters")
+async def compute_clusters(k: int = Query(default=4, ge=2, le=12)):
+    # lazy import sklearn
+    try:
+        from sklearn.cluster import KMeans  # type: ignore
+        import numpy as np  # type: ignore
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Missing dependencies for clustering: {e}")
+
+    refs = await db.reflections.find({}, {"_id": 0, "id": 1, "vector": 1}).to_list(10000)
+    if not refs:
+        return {"assigned": 0}
+
+    X = []
+    ids = []
+    for r in refs:
+        vec = r.get("vector") or []
+        if not vec:
+            # ensure stable vector for clustering
+            vec = fallback_embed(r.get("id", ""))
+        X.append(vec)
+        ids.append(r["id"])
+
+    try:
+        km = KMeans(n_clusters=k, n_init=10, random_state=42)
+        labels = km.fit_predict(X)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Clustering failed: {e}")
+
+    # persist cluster on reflection docs
+    ops = []
+    for rid, lab in zip(ids, labels):
+        ops.append({"filter": {"id": rid}, "update": {"$set": {"cluster": int(lab)}}})
+    # bulk write manually
+    for op in ops:
+        await db.reflections.update_one(op["filter"], op["update"])
+
+    return {"assigned": len(ids), "clusters": int(k)}
+
+@api.post("/compute/anomalies")
+async def compute_anomalies(contamination: float = Query(default=0.05, gt=0.0, lt=0.5)):
+    try:
+        from sklearn.ensemble import IsolationForest  # type: ignore
+        import numpy as np  # type: ignore
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Missing dependencies for anomalies: {e}")
+
+    refs = await db.reflections.find({}, {"_id": 0, "id": 1, "project_id": 1, "vector": 1}).to_list(10000)
+    if not refs:
+        return {"flagged": 0}
+
+    X = []
+    ids = []
+    proj_map = {}
+    for r in refs:
+        vec = r.get("vector") or []
+        if not vec:
+            vec = fallback_embed(r.get("id", ""))
+        X.append(vec)
+        ids.append(r["id"])
+        proj_map[r["id"]] = r["project_id"]
+
+    try:
+        iso = IsolationForest(contamination=contamination, random_state=42)
+        preds = iso.fit_predict(X)  # -1 anomalies, 1 normal
+        scores = iso.decision_function(X)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Anomaly detection failed: {e}")
+
+    flagged = 0
+    for i, rid in enumerate(ids):
+        if preds[i] == -1:
+            flagged += 1
+            sev = 'high' if scores[i] < -0.2 else 'medium'
+            detail = f"Auto anomaly: outlier reflection {rid} (score={scores[i]:.3f})"
+            an = Anomaly(project_id=proj_map[rid], detail=detail, severity=sev)
+            doc = await serialize_dt(an.model_dump())
+            await db.anomalies.insert_one({**doc, "_id": an.id})
+
+    return {"flagged": flagged}
 
 # ----- Graph endpoint (for D3 force-graph) -----
 @api.get("/graph")
@@ -275,6 +368,7 @@ async def graph_data():
     nodes = []
     links = []
 
+    # Projects
     for p in projects:
         nodes.append({
             "id": p["id"],
@@ -282,6 +376,22 @@ async def graph_data():
             "label": p["title"],
             "status": p.get("status", "draft"),
         })
+
+    # Optional cluster nodes
+    clusters = {}
+    for r in reflections:
+        if r.get("cluster") is not None:
+            cid = f"cluster-{r['cluster']}"
+            clusters[cid] = r['cluster']
+
+    for cid, lab in clusters.items():
+        nodes.append({
+            "id": cid,
+            "type": "cluster",
+            "label": f"Cluster {lab}",
+        })
+
+    # Reflections
     for r in reflections:
         rid = r["id"]
         nodes.append({
@@ -290,6 +400,10 @@ async def graph_data():
             "label": (r.get("text", "")[:60] + ("…" if len(r.get("text", "")) > 60 else "")),
         })
         links.append({"source": r["project_id"], "target": rid, "kind": "has_reflection"})
+        if r.get("cluster") is not None:
+            links.append({"source": rid, "target": f"cluster-{r['cluster']}", "kind": "in_cluster"})
+
+    # Anomalies
     for a in anomalies:
         aid = a["id"]
         nodes.append({
@@ -305,12 +419,11 @@ async def graph_data():
 
     return {"nodes": nodes, "links": links, "stats": {"score": score, "projects": len(projects), "reflections": len(reflections), "anomalies": len(anomalies)}}
 
-
 @api.post("/images/generate", response_model=ImageResponse)
 async def generate_image(payload: ImageRequest):
-    client = get_openai_client()
+    client_ai = get_openai_client()
     try:
-        result = await client.images.generate(
+        result = await client_ai.images.generate(
             model="gpt-image-1",
             prompt=payload.prompt,
             size=payload.size,
@@ -321,6 +434,32 @@ async def generate_image(payload: ImageRequest):
     except Exception as e:
         logging.getLogger(__name__).warning(f"Image generation failed: {e}")
         return ImageResponse(url="https://placehold.co/512x512/png?text=AI+Image+error")
+
+# ----- Reflection scheduler (every N hours) -----
+SCHEDULE_HOURS = float(os.environ.get('REFLECTION_SCHEDULE_HOURS', '4'))
+
+async def _auto_reflect_once():
+    # choose most recent project or any
+    proj = await db.projects.find_one({}, sort=[("created_at", -1)])
+    if not proj:
+        return
+    try:
+        await create_reflection(ReflectionCreate(project_id=proj["id"], prompt="Periodic 4h reflection on current market regime and adjustments."))
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"Scheduled reflection failed: {e}")
+
+@app.on_event("startup")
+async def startup_tasks():
+    # try to start apscheduler
+    try:
+        from apscheduler.schedulers.asyncio import AsyncIOScheduler  # type: ignore
+        sched = AsyncIOScheduler()
+        sched.start()
+        next_time = datetime.now(timezone.utc) + timedelta(seconds=10)
+        sched.add_job(_auto_reflect_once, 'interval', hours=SCHEDULE_HOURS, next_run_time=next_time)
+        logging.getLogger(__name__).info("Scheduler started for periodic reflections")
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"APScheduler not available: {e}")
 
 # Include router
 app.include_router(api)
