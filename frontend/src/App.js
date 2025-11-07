@@ -69,32 +69,45 @@ function App() {
   const [aiBanner, setAIBanner] = useState(null);
   const [dataBanner, setDataBanner] = useState(null);
   useEffect(() => {
-    (async () => {
+    let active = true;
+    const checkAI = async () => {
       try {
         const res = await fetch(`${process.env.REACT_APP_BACKEND_URL}/api/ai/health`);
         const j = await res.json();
+        if (!active) return;
         if (!j.ok) {
           const reason = j.reason || "error";
           let msg = "AI is unavailable";
           if (reason === "missing_key") msg = "AI key missing. Add OPENAI_API_KEY in backend/.env and restart backend.";
           if (reason === "unauthorized") msg = "AI unauthorized. Provide a valid OPENAI_API_KEY in backend/.env and restart backend.";
           setAIBanner(msg);
+        } else {
+          setAIBanner(null);
         }
       } catch (e) {
+        if (!active) return;
         setAIBanner("AI status check failed. Try again later.");
       }
+    };
+    const checkData = async () => {
       try {
         const res2 = await fetch(`${process.env.REACT_APP_BACKEND_URL}/api/data/health`);
         const d = await res2.json();
+        if (!active) return;
         if (!d.ok) {
           setDataBanner("Price feed warming up or rate-limited. Using CoinGecko Demo key; will retry.");
         } else {
           setDataBanner(null);
         }
       } catch (e) {
+        if (!active) return;
         setDataBanner("Price feed status unavailable.");
       }
-    })();
+    };
+    checkAI();
+    checkData();
+    const id = setInterval(() => { checkAI(); checkData(); }, 30000);
+    return () => { active = false; clearInterval(id); };
   }, []);
 
   // Load projects
