@@ -576,8 +576,7 @@ async def graph_data():
             "label": a.get("severity", "low"),
             "severity": a.get("severity", "low"),
         })
-        if projects:
-            links.append({"source": projects[-1]["id"], "target": aid, "kind": "has_anomaly", "weight": 1})
+        links.append({"source": a["project_id"], "target": aid, "kind": "has_anomaly", "weight": 1})
 
     # Predictions overlay: latest per horizon
     icon = {0: "↓", 1: "→", 2: "↑"}
