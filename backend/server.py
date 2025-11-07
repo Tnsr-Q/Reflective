@@ -248,6 +248,15 @@ async def create_anomaly(payload: AnomalyCreate):
     return an
 
 @api.get("/anomalies", response_model=List[Anomaly])
+
+class ImageRequest(BaseModel):
+    prompt: str = Field(min_length=1, max_length=800)
+    size: Optional[str] = Field(default="512x512")
+    quality: Optional[str] = Field(default="standard")
+
+class ImageResponse(BaseModel):
+    url: str
+
 async def list_anomalies(project_id: Optional[str] = Query(default=None)):
     filt = {"project_id": project_id} if project_id else {}
     docs = await db.anomalies.find(filt, {"_id": 0}).sort("created_at", -1).to_list(1000)
