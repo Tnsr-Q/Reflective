@@ -156,14 +156,12 @@ _json_block_re = re.compile(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", re.IGNORECAS
 def parse_json_relaxed(content: str) -> Dict[str, Any]:
     if not content:
         return {}
-    # Try fenced block first
     m = _json_block_re.search(content)
     if m:
         try:
             return json.loads(m.group(1))
         except Exception:
             pass
-    # Fallback: find first { ... } block
     start = content.find("{")
     end = content.rfind("}")
     if start != -1 and end != -1 and end > start:
@@ -319,94 +317,25 @@ async def list_anomalies(project_id: Optional[str] = Query(default=None)):
             d['created_at'] = datetime.fromisoformat(d['created_at'])
     return docs
 
-# ----- Compute: Clustering & Surprise Detection -----
-@api.post("/compute/clusters")
-async def compute_clusters(k: int = Query(default=4, ge=2, le=12)):
-    try:
-        from sklearn.cluster import KMeans  # type: ignore
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Missing dependencies for clustering: {e}")
-
-    refs = await db.reflections.find({}, {"_id": 0, "id": 1, "vector": 1}).to_list(10000)
-    if not refs:
-        return {"assigned": 0}
-
-    X = []
-    ids = []
-    for r in refs:
-        vec = r.get("vector") or []
-        if not vec:
-            vec = fallback_embed(r.get("id", ""))
-        X.append(vec)
-        ids.append(r["id"])
-
-    try:
-        km = KMeans(n_clusters=k, n_init=10, random_state=42)
-        labels = km.fit_predict(X)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Clustering failed: {e}")
-
-    for rid, lab in zip(ids, labels):
-        await db.reflections.update_one({"id": rid}, {"$set": {"cluster": int(lab)}})
-
-    return {"assigned": len(ids), "clusters": int(k)}
-
-@api.post("/compute/anomalies")
-async def compute_anomalies(contamination: float = Query(default=0.05, gt=0.0, lt=0.5)):
-    try:
-        from sklearn.ensemble import IsolationForest  # type: ignore
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Missing dependencies for anomalies: {e}")
-
-    refs = await db.reflections.find({}, {"_id": 0, "id": 1, "project_id": 1, "vector": 1}).to_list(10000)
-    if not refs:
-        return {"flagged": 0}
-
-    X = []
-    ids = []
-    proj_map = {}
-    for r in refs:
-        vec = r.get("vector") or []
-        if not vec:
-            vec = fallback_embed(r.get("id", ""))
-        X.append(vec)
-        ids.append(r["id"])
-        proj_map[r["id"]] = r["project_id"]
-
-    try:
-        iso = IsolationForest(contamination=contamination, random_state=42)
-        preds = iso.fit_predict(X)  # -1 anomalies, 1 normal
-        scores = iso.decision_function(X)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Anomaly detection failed: {e}")
-
-    flagged = 0
-    for i, rid in enumerate(ids):
-        if preds[i] == -1:
-            flagged += 1
-            sev = 'high' if scores[i] < -0.2 else 'medium'
-            detail = f"Auto anomaly: outlier reflection {rid} (score={scores[i]:.3f})"
-            an = Anomaly(project_id=proj_map[rid], detail=detail, severity=sev)
-            doc = await serialize_dt(an.model_dump())
-            await db.anomalies.insert_one({**doc, "_id": an.id})
-
-    return {"flagged": flagged}
-
-# ----- Ticker and price data -----
-DATA_SOURCE = os.environ.get('DATA_SOURCE', 'coingecko')
-CG_KEY = os.environ.get('COINGECKO_API_KEY')
+# ----- Ticker and price data with CG Demo/Pro + Binance fallback -----
+DATA_SOURCE = os.environ.get('DATA_SOURCE', 'coingecko')  # coingecko | binance | coingecko-only
+CG_PRO_KEY = os.environ.get('COINGECKO_API_KEY')  # Pro plan key (header: x-cg-pro-api-key)
+CG_DEMO_KEY = os.environ.get('COINGECKO_DEMO_API_KEY')  # Demo plan key (header: x-cg-demo-api-key)
 _last_candle_ts: Optional[int] = None
 _ingest_backoff: int = 60
 
 async def fetch_latest_candle_coingecko() -> bool:
     import httpx
     try:
-        if CG_KEY:
+        # Use Public Demo by default if demo key present, else Pro if pro key present, else public no-key
+        base = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart"
+        headers = {}
+        if CG_PRO_KEY:
             base = "https://pro-api.coingecko.com/api/v3/coins/bitcoin/market_chart"
-            headers = {"x-cg-pro-api-key": CG_KEY}
-        else:
-            base = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart"
-            headers = {}
+            headers["x-cg-pro-api-key"] = CG_PRO_KEY
+        elif CG_DEMO_KEY:
+            # Demo key must hit the public root URL with header x-cg-demo-api-key
+            headers["x-cg-demo-api-key"] = CG_DEMO_KEY
         params = {"vs_currency": "usd", "days": "1", "interval": "minutely"}
         async with httpx.AsyncClient(timeout=20) as hc:
             r = await hc.get(base, params=params, headers=headers)
@@ -437,7 +366,6 @@ async def fetch_latest_candle_coingecko() -> bool:
 async def fetch_latest_candle_binance() -> bool:
     import httpx
     try:
-        # 1 latest 1m kline for BTCUSDT
         url = "https://api.binance.com/api/v3/klines"
         params = {"symbol": "BTCUSDT", "interval": "1m", "limit": 1}
         async with httpx.AsyncClient(timeout=20) as hc:
@@ -463,7 +391,6 @@ async def fetch_latest_candle_binance() -> bool:
         return False
 
 async def fetch_latest_candle() -> bool:
-    # Try configured source first, fall back if allowed
     source = DATA_SOURCE.lower()
     success = False
     if source in ("coingecko", "coingecko-only"):
@@ -669,7 +596,7 @@ async def _tick_ingest():
     while True:
         ok = await fetch_latest_candle()
         if not ok:
-            _ingest_backoff = min(300, _ingest_backoff + 30)  # backoff up to 5 minutes
+            _ingest_backoff = min(300, _ingest_backoff + 30)
         else:
             _ingest_backoff = 60
         await asyncio.sleep(_ingest_backoff)
