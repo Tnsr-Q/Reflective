@@ -56,3 +56,21 @@ export async function computeAnomalies(contamination = 0.05) {
   const { data } = await api.post(`/compute/anomalies`, null, { params: { contamination } });
   return data;
 }
+
+// Live price & predictions
+export async function getTicker() {
+  const { data } = await api.get(`/ticker`);
+  return data;
+}
+export async function getSchedulerStatus() {
+  const { data } = await api.get(`/scheduler/status`);
+  return data;
+}
+export async function getLatestPredictions() {
+  const { data } = await api.get(`/predictions/latest`);
+  return data;
+}
+export async function getPredictionHistory(horizon, limit = 50) {
+  const { data } = await api.get(`/predictions/history`, { params: { horizon, limit } });
+  return data;
+}
