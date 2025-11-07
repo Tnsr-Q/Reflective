@@ -127,6 +127,35 @@ function App() {
       setProjects(list);
       if (!selectedProjectId && list.length) setSelectedProjectId(list[0].id);
     })();
+
+  // Ticker & predictions state
+  const [ticker, setTicker] = useState({ price: null, change24h: null });
+  const [sched, setSched] = useState({ next_reflection: null, next_prediction: null });
+  const [latestPreds, setLatestPreds] = useState([]);
+
+  // Load ticker/scheduler/predictions periodically
+  useEffect(() => {
+    let active = true;
+    const load = async () => {
+      try {
+        const [t, s, p] = await Promise.all([
+          getTicker().catch(() => ({})),
+          getSchedulerStatus().catch(() => ({})),
+          getLatestPredictions().catch(() => ([])),
+        ]);
+        if (!active) return;
+        setTicker({ price: t?.price ?? null, change24h: t?.change24h ?? null });
+        setSched({ next_reflection: s?.next_reflection ?? null, next_prediction: s?.next_prediction ?? null });
+        setLatestPreds(Array.isArray(p) ? p : []);
+      } catch (e) {
+        // ignore
+      }
+    };
+    load();
+    const id = setInterval(load, 15000);
+    return () => { active = false; clearInterval(id); };
+  }, []);
+
   }, [refreshTick]);
 
   const stats = useMemo(() => data?.stats || { score: 0 }, [data]);
