@@ -187,6 +187,11 @@ function App() {
           <strong>Notice:</strong> {aiBanner}
         </div>
       )}
+      {dataBanner && (
+        <div data-testid="data-banner" className="panel" style={{ maxWidth: 1200, margin: "0 auto 12px", borderColor: "#eab308" }}>
+          <strong>Feed:</strong> {dataBanner}
+        </div>
+      )}
 
       <main className="container" style={{ maxWidth: 1200, margin: "0 auto", padding: 16 }}>
         <Ticker price={ticker.price} change24h={ticker.change24h} nextPredictionAt={sched.next_prediction} />
