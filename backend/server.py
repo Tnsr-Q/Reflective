@@ -305,6 +305,23 @@ async def graph_data():
 
     return {"nodes": nodes, "links": links, "stats": {"score": score, "projects": len(projects), "reflections": len(reflections), "anomalies": len(anomalies)}}
 
+
+@api.post("/images/generate", response_model=ImageResponse)
+async def generate_image(payload: ImageRequest):
+    client = get_openai_client()
+    try:
+        result = await client.images.generate(
+            model="gpt-image-1",
+            prompt=payload.prompt,
+            size=payload.size,
+            quality=payload.quality,
+        )
+        url = result.data[0].url  # type: ignore[attr-defined]
+        return ImageResponse(url=url)
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"Image generation failed: {e}")
+        return ImageResponse(url="https://placehold.co/512x512/png?text=AI+Image+error")
+
 # Include router
 app.include_router(api)
 
