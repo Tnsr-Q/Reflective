@@ -127,6 +127,7 @@ function App() {
       setProjects(list);
       if (!selectedProjectId && list.length) setSelectedProjectId(list[0].id);
     })();
+  }, [refreshTick]);
 
   // Ticker & predictions state
   const [ticker, setTicker] = useState({ price: null, change24h: null });
@@ -155,8 +156,6 @@ function App() {
     const id = setInterval(load, 15000);
     return () => { active = false; clearInterval(id); };
   }, []);
-
-  }, [refreshTick]);
 
   const stats = useMemo(() => data?.stats || { score: 0 }, [data]);
 
