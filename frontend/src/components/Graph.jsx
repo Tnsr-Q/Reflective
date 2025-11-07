@@ -22,6 +22,7 @@ export default function Graph({ data, onNodeClick }) {
     const color = (d) => {
       if (d.type === "project") return "#38bdf8"; // cyan
       if (d.type === "reflection") return "#22c55e"; // green
+      if (d.type === "cluster") return "#818cf8"; // indigo
       if (d.type === "anomaly") {
         switch (d.severity) {
           case "critical":
@@ -37,9 +38,11 @@ export default function Graph({ data, onNodeClick }) {
       return "#94a3b8";
     };
 
+    const linkDistance = (d) => (d.weight ? 90 : 150);
+
     const simulation = d3
       .forceSimulation(data.nodes)
-      .force("link", d3.forceLink(data.links).id((d) => d.id).distance(90))
+      .force("link", d3.forceLink(data.links).id((d) => d.id).distance(linkDistance))
       .force("charge", d3.forceManyBody().strength(-160))
       .force("center", d3.forceCenter(width / 2, height / 2));
 
@@ -51,7 +54,7 @@ export default function Graph({ data, onNodeClick }) {
       .data(data.links)
       .join("line")
       .attr("data-testid", (d) => `graph-link-${d.source}-${d.target}`)
-      .attr("stroke-width", 1.4);
+      .attr("stroke-width", (d) => (d.weight ? 1.8 : 1.2));
 
     const node = svg
       .append("g")
@@ -60,7 +63,7 @@ export default function Graph({ data, onNodeClick }) {
       .selectAll("circle")
       .data(data.nodes)
       .join("circle")
-      .attr("r", 8)
+      .attr("r", (d) => (d.type === "cluster" ? 10 : 8))
       .attr("fill", color)
       .attr("data-testid", (d) => `graph-node-${d.id}`)
       .call(

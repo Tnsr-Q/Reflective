@@ -60,6 +60,26 @@ function App() {
   const [contamination, setContamination] = useState(0.05);
   const [computeBusy, setComputeBusy] = useState(false);
 
+  // AI Health banner
+  const [aiBanner, setAIBanner] = useState(null);
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await fetch(`${process.env.REACT_APP_BACKEND_URL}/api/ai/health`);
+        const j = await res.json();
+        if (!j.ok) {
+          const reason = j.reason || "error";
+          let msg = "AI is unavailable";
+          if (reason === "missing_key") msg = "AI key missing. Add OPENAI_API_KEY in backend/.env and restart backend.";
+          if (reason === "unauthorized") msg = "AI unauthorized. Provide a valid OPENAI_API_KEY in backend/.env and restart backend.";
+          setAIBanner(msg);
+        }
+      } catch (e) {
+        setAIBanner("AI status check failed. Try again later.");
+      }
+    })();
+  }, []);
+
   // Load projects
   useEffect(() => {
     (async () => {
@@ -149,6 +169,12 @@ function App() {
         <h1 data-testid="app-title">AI‑Reflect Dashboard</h1>
         <p>Projects, Reflections (AI), Clusters & Anomalies mapped as a force‑graph</p>
       </header>
+
+      {aiBanner && (
+        <div data-testid="ai-banner" className="panel" style={{ maxWidth: 1200, margin: "0 auto 12px", borderColor: "#ef4444" }}>
+          <strong>Notice:</strong> {aiBanner}
+        </div>
+      )}
 
       <main className="container" style={{ maxWidth: 1200, margin: "0 auto", padding: 16 }}>
         <div className="grid" style={{ marginBottom: 16 }}>
@@ -281,13 +307,11 @@ function App() {
 
           <div className="panel" style={{ gridColumn: "span 3" }}>
             <h3>Stats</h3>
-            <div className="stat" data-testid="stat-score">Score: {stats.score}</div>
+            <div className="stat" data-testid="stat-score">Score: {Math.max(0, stats.score)}</div>
             <div className="stat" data-testid="stat-projects">Projects: {stats.projects}</div>
             <div className="stat" data-testid="stat-reflections">Reflections: {stats.reflections}</div>
             <div className="stat" data-testid="stat-anomalies">Anomalies: {stats.anomalies}</div>
-            <div style={{ marginTop: 8, fontSize: 12, color: "#94a3b8" }}>
-              Tip: Score is 2×reflections − anomalies (for quick visual feedback)
-            </div>
+            <SchedulerInfo />
           </div>
         </div>
 
@@ -343,6 +367,26 @@ function App() {
           </div>
         </div>
       </main>
+    </div>
+  );
+}
+
+function SchedulerInfo() {
+  const [nextRunAt, setNextRunAt] = useState(null);
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await fetch(`${process.env.REACT_APP_BACKEND_URL}/api/scheduler/status`);
+        const j = await res.json();
+        setNextRunAt(j?.next_run_at || null);
+      } catch (e) {
+        setNextRunAt(null);
+      }
+    })();
+  }, []);
+  return (
+    <div style={{ marginTop: 8, fontSize: 12, color: "#94a3b8" }}>
+      <div data-testid="scheduler-next-run">Next auto-reflection: {nextRunAt ? new Date(nextRunAt).toLocaleString() : "loading…"}</div>
     </div>
   );
 }
