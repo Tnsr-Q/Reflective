@@ -340,6 +340,9 @@ async def fetch_latest_candle_coingecko() -> bool:
             params["x_cg_demo_api_key"] = CG_DEMO_KEY
         async with httpx.AsyncClient(timeout=20) as hc:
             r = await hc.get(base, params=params, headers=headers)
+            status = r.status_code
+            if status >= 400:
+                logging.getLogger(__name__).warning(f"coingecko market_chart status={status} text={r.text[:200]}")
             r.raise_for_status()
             data = r.json()
         prices = data.get("prices", [])
