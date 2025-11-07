@@ -376,8 +376,8 @@ async def fetch_latest_candle_coingecko() -> bool:
                     ts = int(datetime.now(timezone.utc).timestamp())
                     candle = {"ts": ts, "open": price, "high": price, "low": price, "close": price, "volume": 0.0}
                     await db.price_candles.update_one({"ts": candle["ts"]}, {"$set": candle}, upsert=True)
-                    global _last_candle_ts
-                    _last_candle_ts = candle["ts"]
+                    # update last candle ts
+                    globals()["_last_candle_ts"] = candle["ts"]
                     return True
         except Exception as e2:
             logging.getLogger(__name__).warning(f"simple price fallback failed: {e2}")
