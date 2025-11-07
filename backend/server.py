@@ -9,6 +9,9 @@ from pydantic import BaseModel, Field, ConfigDict
 from typing import List, Optional, Literal, Dict, Any
 import uuid
 from datetime import datetime, timezone, timedelta
+import asyncio
+import json
+import hashlib
 
 # Load env
 ROOT_DIR = Path(__file__).parent
@@ -51,7 +54,6 @@ class ProjectUpdate(BaseModel):
 
 class ReflectionCreate(BaseModel):
     project_id: str
-    # Either provide text, or provide prompt to generate with AI
     text: Optional[str] = None
     prompt: Optional[str] = None
 
@@ -88,12 +90,33 @@ class AIHealth(BaseModel):
     ok: bool
     reason: Optional[str] = None
 
-# ----- OpenAI (via Emergent LLM key from env) -----
+# Price candles
+class Candle(BaseModel):
+    ts: int  # epoch seconds
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+
+# Predictions
+PredictionHorizon = Literal['1h','4h','8h','24h','3d','2w','1m']
+class Prediction(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    horizon: PredictionHorizon
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    target_ts: int
+    direction: int = Field(ge=0, le=2)  # 0 lower, 1 same, 2 higher
+    confidence: float = Field(ge=0, le=1)
+    sentiment: Literal['bullish','neutral','bearish']
+    reasoning_text: str = ""
+    vector: List[float] = Field(default_factory=list)
+
+# ----- OpenAI (via env) -----
 OPENAI_KEY = os.environ.get('OPENAI_API_KEY')
 OPENAI_CHAT_MODEL = os.environ.get('OPENAI_CHAT_MODEL', 'gpt-4o-mini')
 OPENAI_EMBED_MODEL = os.environ.get('OPENAI_EMBED_MODEL', 'text-embedding-3-small')
 
-# Lazy import to avoid import error if not installed yet
 async_openai_client = None
 
 def get_openai_client():
@@ -116,13 +139,9 @@ async def serialize_dt(doc: Dict[str, Any]) -> Dict[str, Any]:
             out[k] = v.isoformat()
     return out
 
-# Simple deterministic pseudo-embedding as last-resort fallback
-import hashlib
-
 def fallback_embed(text: str, dim: int = 64) -> List[float]:
     h = hashlib.sha256(text.encode("utf-8")).digest()
     vals = []
-    # repeat hash to fill dim
     while len(vals) < dim:
         for b in h:
             vals.append(((b / 255.0) * 2.0) - 1.0)
@@ -193,10 +212,9 @@ async def update_project(project_id: str, payload: ProjectUpdate):
             doc[key] = datetime.fromisoformat(doc[key])
     return doc
 
-# ----- Reflection Endpoints (with AI + Embeddings) -----
+# ----- Reflection Endpoints (AI + Embeddings) -----
 @api.post("/reflections", response_model=Reflection)
 async def create_reflection(payload: ReflectionCreate):
-    # Ensure project exists
     proj = await db.projects.find_one({"id": payload.project_id})
     if not proj:
         raise HTTPException(status_code=404, detail="Project not found")
@@ -206,7 +224,6 @@ async def create_reflection(payload: ReflectionCreate):
     if not text:
         if not payload.prompt:
             raise HTTPException(status_code=400, detail="Provide either 'text' or 'prompt' to generate reflection")
-        # Generate text via OpenAI chat
         client_ai = get_openai_client()
         try:
             completion = await client_ai.chat.completions.create(
@@ -220,10 +237,8 @@ async def create_reflection(payload: ReflectionCreate):
             )
             text = completion.choices[0].message.content or ""
         except Exception:
-            # Fallback to a deterministic reflection if AI is unavailable (e.g., missing key or network)
             text = f"Auto-reflection (fallback): Based on the prompt, focus on reducing overfitting, validating signals against multiple timeframes, and weighting volume/volatility to avoid chasing noise. Prompt: {payload.prompt[:180]}"
 
-    # Generate embedding for text
     vector: List[float] = []
     try:
         client_ai = get_openai_client()
@@ -283,7 +298,6 @@ async def list_anomalies(project_id: Optional[str] = Query(default=None)):
 # ----- Compute: Clustering & Surprise Detection -----
 @api.post("/compute/clusters")
 async def compute_clusters(k: int = Query(default=4, ge=2, le=12)):
-    # lazy import sklearn
     try:
         from sklearn.cluster import KMeans  # type: ignore
     except Exception as e:
@@ -298,7 +312,6 @@ async def compute_clusters(k: int = Query(default=4, ge=2, le=12)):
     for r in refs:
         vec = r.get("vector") or []
         if not vec:
-            # ensure stable vector for clustering
             vec = fallback_embed(r.get("id", ""))
         X.append(vec)
         ids.append(r["id"])
@@ -309,7 +322,6 @@ async def compute_clusters(k: int = Query(default=4, ge=2, le=12)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Clustering failed: {e}")
 
-    # persist cluster on reflection docs
     for rid, lab in zip(ids, labels):
         await db.reflections.update_one({"id": rid}, {"$set": {"cluster": int(lab)}})
 
@@ -440,7 +452,6 @@ async def ai_health():
         return AIHealth(ok=False, reason="missing_key")
     try:
         client_ai = get_openai_client()
-        # cheap call: 1 token embed
         await client_ai.embeddings.create(model=OPENAI_EMBED_MODEL, input="ok")
         return AIHealth(ok=True)
     except Exception as e:
@@ -449,40 +460,222 @@ async def ai_health():
             return AIHealth(ok=False, reason="unauthorized")
         return AIHealth(ok=False, reason="error")
 
-# ----- Reflection scheduler (every N hours) -----
+# ----- Live data ingestion (CoinGecko free/pro) -----
+DATA_SOURCE = os.environ.get('DATA_SOURCE', 'coingecko')
+CG_KEY = os.environ.get('COINGECKO_API_KEY')
+_last_candle_ts: Optional[int] = None
+
+async def fetch_latest_candle():
+    import httpx
+    global _last_candle_ts
+    try:
+        if DATA_SOURCE == 'coingecko':
+            if CG_KEY:
+                base = "https://pro-api.coingecko.com/api/v3/coins/bitcoin/market_chart"
+                headers = {"x-cg-pro-api-key": CG_KEY}
+            else:
+                base = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart"
+                headers = {}
+            params = {"vs_currency": "usd", "days": "1", "interval": "minutely"}
+            async with httpx.AsyncClient(timeout=20) as hc:
+                r = await hc.get(base, params=params, headers=headers)
+                r.raise_for_status()
+                data = r.json()
+            prices = data.get("prices", [])
+            vols = data.get("total_volumes", [])
+            if not prices:
+                return
+            ts_ms, price = prices[-1]
+            vol = vols[-1][1] if vols else 0.0
+            candle = {
+                "ts": int(ts_ms // 1000),
+                "open": float(price),
+                "high": float(price),
+                "low": float(price),
+                "close": float(price),
+                "volume": float(vol),
+            }
+            await db.price_candles.update_one({"ts": candle["ts"]}, {"$set": candle}, upsert=True)
+            _last_candle_ts = candle["ts"]
+        else:
+            # Extend for other sources later
+            pass
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"ingest error: {e}")
+
+@api.get("/data/health")
+async def data_health():
+    now = int(datetime.now(timezone.utc).timestamp())
+    age = (now - _last_candle_ts) if _last_candle_ts else None
+    ok = age is not None and age < 180
+    return {"source": DATA_SOURCE, "ok": bool(ok), "last_ts": _last_candle_ts, "age_sec": age}
+
+@api.get("/candles/latest", response_model=Candle)
+async def candles_latest():
+    doc = await db.price_candles.find_one({}, sort=[("ts", -1)], projection={"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="No candles yet")
+    return doc
+
+@api.get("/ticker")
+async def ticker():
+    latest = await db.price_candles.find_one({}, sort=[("ts", -1)], projection={"_id": 0})
+    if not latest:
+        raise HTTPException(status_code=404, detail="No candles yet")
+    # compute 24h change if we have old candle
+    target_ts = latest["ts"] - 86400
+    past = await db.price_candles.find_one({"ts": {"$lte": target_ts}}, sort=[("ts", -1)], projection={"_id": 0})
+    change_pct = 0.0
+    if past and past.get("close"):
+        change_pct = ((latest["close"] - past["close"]) / past["close"]) * 100.0
+    return {"price": latest["close"], "change24h": change_pct}
+
+# ----- Prediction Loop -----
+HORIZONS: List[tuple[str, int]] = [("1h", 60), ("4h", 240), ("8h", 480), ("24h", 1440), ("3d", 4320), ("2w", 20160), ("1m", 43200)]
+
+async def predict_once() -> Dict[str, Any]:
+    # Pull last 60 min candles
+    cutoff = int(datetime.now(timezone.utc).timestamp()) - 60 * 60
+    candles = await db.price_candles.find({"ts": {"$gte": cutoff}}, {"_id": 0}).sort("ts", 1).to_list(200)
+    closes = [c["close"] for c in candles]
+    now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+
+    # Build prompt
+    text_rows = "\n".join(f"{c['ts']}: {c['close']:.2f}" for c in candles[-60:])
+    prompt = (
+        "Given the last 60 one-minute BTC closes, output compact JSON with one entry per horizon: "
+        "['1h','4h','8h','24h','3d','2w','1m']. Each entry has keys: dir (0 lower/1 same/2 higher), "
+        "conf (0..1), sent ('bullish'|'neutral'|'bearish'), explain (<=200 chars).\nData:\n" + text_rows
+    )
+
+    outputs: Dict[str, Dict[str, Any]] = {}
+    used_fallback = False
+    if OPENAI_KEY:
+        try:
+            client_ai = get_openai_client()
+            resp = await client_ai.chat.completions.create(
+                model=OPENAI_CHAT_MODEL,
+                messages=[{"role": "system", "content": "You are a BTC analyst."}, {"role": "user", "content": prompt}],
+                temperature=0.3,
+                max_tokens=400,
+            )
+            content = resp.choices[0].message.content or "{}"
+            parsed = json.loads(content)
+            if isinstance(parsed, dict):
+                outputs = parsed
+        except Exception as e:
+            logging.getLogger(__name__).warning(f"prediction openai error: {e}")
+            used_fallback = True
+    else:
+        used_fallback = True
+
+    # Fallback: all horizons 'same', conf 0, neutral
+    if used_fallback or not outputs:
+        outputs = {h: {"dir": 1, "conf": 0.0, "sent": "neutral", "explain": "fallback"} for (h, _) in HORIZONS}
+
+    # Persist predictions
+    inserted = []
+    for h, mins in HORIZONS:
+        item = outputs.get(h) or {"dir": 1, "conf": 0.0, "sent": "neutral", "explain": "fallback"}
+        dir_i = int(item.get("dir", 1))
+        conf = float(item.get("conf", 0.0))
+        sent = str(item.get("sent", "neutral"))
+        explain = str(item.get("explain", ""))
+
+        vec: List[float] = []
+        try:
+            if OPENAI_KEY:
+                client_ai = get_openai_client()
+                emb = await client_ai.embeddings.create(model=OPENAI_EMBED_MODEL, input=explain or "prediction", encoding_format="float")
+                vec = emb.data[0].embedding  # type: ignore
+        except Exception as e:
+            logging.getLogger(__name__).warning(f"prediction embed error: {e}")
+            vec = fallback_embed(explain or h)
+
+        doc = Prediction(
+            horizon=h, target_ts=int(now.timestamp()) + mins * 60, direction=dir_i, confidence=conf,
+            sentiment=(sent if sent in ("bullish","neutral","bearish") else "neutral"), reasoning_text=explain, vector=vec
+        )
+        dumped = await serialize_dt(doc.model_dump())
+        await db.predictions.insert_one({**dumped, "_id": doc.id})
+        inserted.append(doc.id)
+
+    return {"inserted": inserted}
+
+@api.get("/predictions/latest")
+async def predictions_latest():
+    out = []
+    for h, _ in HORIZONS:
+        doc = await db.predictions.find_one({"horizon": h}, sort=[("created_at", -1)], projection={"_id": 0})
+        if doc:
+            out.append(doc)
+    return out
+
+@api.get("/predictions/history")
+async def predictions_history(horizon: PredictionHorizon, limit: int = Query(default=50, ge=1, le=500)):
+    docs = await db.predictions.find({"horizon": horizon}, {"_id": 0}).sort("created_at", -1).limit(limit).to_list(length=limit)
+    return docs
+
+@api.post("/predictions/run")
+async def predictions_run():
+    result = await predict_once()
+    return result
+
+# ----- Reflection scheduler + ingest + predictions scheduling -----
 SCHEDULE_HOURS = float(os.environ.get('REFLECTION_SCHEDULE_HOURS', '4'))
 SCHED_NEXT: Optional[str] = None
+PRED_NEXT: Optional[str] = None
 
 async def _auto_reflect_once():
     global SCHED_NEXT
-    # choose most recent project or any
     proj = await db.projects.find_one({}, sort=[("created_at", -1)])
     if proj:
         try:
             await create_reflection(ReflectionCreate(project_id=proj["id"], prompt="Periodic 4h reflection on current market regime and adjustments."))
         except Exception as e:
             logging.getLogger(__name__).warning(f"Scheduled reflection failed: {e}")
-    # update next time hint
     SCHED_NEXT = (datetime.now(timezone.utc) + timedelta(hours=SCHEDULE_HOURS)).isoformat()
+
+async def _tick_ingest():
+    while True:
+        await fetch_latest_candle()
+        await asyncio.sleep(60)
+
+async def _schedule_predictions():
+    global PRED_NEXT
+    while True:
+        # run on top of hour
+        now = datetime.now(timezone.utc)
+        next_top = (now + timedelta(hours=1)).replace(minute=0, second=5, microsecond=0)
+        PRED_NEXT = next_top.isoformat()
+        await asyncio.sleep((next_top - now).total_seconds())
+        try:
+            await predict_once()
+        except Exception as e:
+            logging.getLogger(__name__).warning(f"predict loop error: {e}")
 
 @api.get("/scheduler/status")
 async def scheduler_status():
-    return {"next_run_at": SCHED_NEXT}
+    return {"next_reflection": SCHED_NEXT, "next_prediction": PRED_NEXT}
 
 @app.on_event("startup")
 async def startup_tasks():
-    global SCHED_NEXT
-    # try to start apscheduler
+    # indexes
     try:
-        from apscheduler.schedulers.asyncio import AsyncIOScheduler  # type: ignore
-        sched = AsyncIOScheduler()
-        sched.start()
-        next_time = datetime.now(timezone.utc) + timedelta(seconds=10)
-        SCHED_NEXT = next_time.isoformat()
-        sched.add_job(_auto_reflect_once, 'interval', hours=SCHEDULE_HOURS, next_run_time=next_time)
-        logging.getLogger(__name__).info("Scheduler started for periodic reflections")
+        await db.price_candles.create_index("ts", unique=True)
+        await db.predictions.create_index([("horizon", 1), ("created_at", -1)])
     except Exception as e:
-        logging.getLogger(__name__).warning(f"APScheduler not available: {e}")
+        logging.getLogger(__name__).warning(f"index create error: {e}")
+
+    # start background loops (ingest + prediction + reflection via naive loops)
+    try:
+        asyncio.create_task(_tick_ingest())
+        asyncio.create_task(_schedule_predictions())
+        # reflection next time seed
+        global SCHED_NEXT
+        SCHED_NEXT = (datetime.now(timezone.utc) + timedelta(seconds=10)).isoformat()
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"background loops error: {e}")
 
 # Include router
 app.include_router(api)
