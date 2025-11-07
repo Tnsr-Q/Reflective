@@ -1,34 +1,52 @@
-.App-logo {
-    height: 40vmin;
-    pointer-events: none;
+/* Base styles aligned with enhanced_frontend.html spirit */
+.App {
+  min-height: 100vh;
+  background: radial-gradient(1200px 600px at 50% -20%, rgba(14, 165, 233, 0.15), transparent),
+              linear-gradient(180deg, #0b1220 0%, #0a0f1a 100%);
+  color: #e5e7eb;
 }
-
-@media (prefers-reduced-motion: no-preference) {
-    .App-logo {
-        animation: App-logo-spin infinite 20s linear;
-    }
+.header {
+  text-align: center;
+  padding-top: 24px;
 }
-
-.App-header {
-    background-color: #0f0f10;
-    min-height: 100vh;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    font-size: calc(10px + 2vmin);
-    color: white;
+.panel {
+  background: rgba(15, 23, 42, 0.6);
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  border-radius: 12px;
+  padding: 16px;
 }
-
-.App-link {
-    color: #61dafb;
+.input, .select, .textarea {
+  width: 100%;
+  background: rgba(2,6,23,0.6);
+  border: 1px solid #334155;
+  color: #e2e8f0;
+  padding: 10px 12px;
+  border-radius: 8px;
 }
-
-@keyframes App-logo-spin {
-    from {
-        transform: rotate(0deg);
-    }
-    to {
-        transform: rotate(360deg);
-    }
+.button {
+  background: #06b6d4;
+  color: #0b1220;
+  border: none;
+  padding: 10px 14px;
+  border-radius: 8px;
+  cursor: pointer;
 }
+.button:disabled { opacity: 0.6; cursor: not-allowed; }
+.grid {
+  display: grid;
+  grid-template-columns: repeat(12, 1fr);
+  gap: 16px;
+}
+.stat {
+  font-weight: 600;
+}
+.badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 9999px;
+  font-size: 12px;
+}
+.badge.low { background: #525252; }
+.badge.medium { background: #eab308; color: #0b1220; }
+.badge.high { background: #f97316; color: #0b1220; }
+.badge.critical { background: #ef4444; }
