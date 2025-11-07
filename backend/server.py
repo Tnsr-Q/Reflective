@@ -13,6 +13,7 @@ import asyncio
 import json
 import hashlib
 import re
+import random
 
 # Load env
 ROOT_DIR = Path(__file__).parent
@@ -64,6 +65,8 @@ class Reflection(BaseModel):
     text: str
     vector: List[float] = Field(default_factory=list)
     cluster: Optional[int] = None
+    flagged_false_ids: List[str] = Field(default_factory=list)
+    deception_detected: bool = False
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 Severity = Literal['low', 'medium', 'high', 'critical']
@@ -113,6 +116,23 @@ class Prediction(BaseModel):
     reasoning_text: str = ""
     vector: List[float] = Field(default_factory=list)
 
+# Opponent & Misinfo
+class OpponentPrediction(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    persona: Literal['honest','bluffer','chaotic']
+    horizon: PredictionHorizon = '1h'
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    target_ts: int
+    direction: int = Field(ge=0, le=2)
+    rationale: str = ""
+    truthful_flag: Optional[bool] = None
+
+class Misinfo(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    headline: str
+    source: str = "tweet"
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
 # ----- OpenAI (via env) -----
 OPENAI_KEY = os.environ.get('OPENAI_API_KEY')
 OPENAI_CHAT_MODEL = os.environ.get('OPENAI_CHAT_MODEL', 'gpt-4o-mini')
@@ -150,7 +170,6 @@ def fallback_embed(text: str, dim: int = 64) -> List[float]:
                 break
     return vals
 
-# Relaxed JSON extractor for LLM responses
 _json_block_re = re.compile(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", re.IGNORECASE)
 
 def parse_json_relaxed(content: str) -> Dict[str, Any]:
@@ -234,7 +253,7 @@ async def update_project(project_id: str, payload: ProjectUpdate):
             doc[key] = datetime.fromisoformat(doc[key])
     return doc
 
-# ----- Reflection Endpoints (AI + Embeddings) -----
+# ----- Reflection Endpoints (AI + Embeddings + Deception flags) -----
 @api.post("/reflections", response_model=Reflection)
 async def create_reflection(payload: ReflectionCreate):
     proj = await db.projects.find_one({"id": payload.project_id})
@@ -261,6 +280,33 @@ async def create_reflection(payload: ReflectionCreate):
         except Exception:
             text = f"Auto-reflection (fallback): Based on the prompt, focus on reducing overfitting, validating signals against multiple timeframes, and weighting volume/volatility to avoid chasing noise. Prompt: {payload.prompt[:180]}"
 
+    # Misinfo context (last 3h)
+    since = datetime.now(timezone.utc) - timedelta(hours=3)
+    misinfos = await db.misinfo_events.find({"created_at": {"$gte": since.isoformat()}}, {"_id": 0}).sort("created_at", -1).to_list(10)
+
+    flagged_ids: List[str] = []
+    deception_detected = False
+    if OPENAI_KEY and misinfos:
+        try:
+            client_ai = get_openai_client()
+            info_blob = json.dumps([{k: v for k, v in m.items() if k in ("id","headline","source","created_at")} for m in misinfos])
+            judge_prompt = (
+                "You may be lied to. Given these external statements (tweets/news), return JSON with key 'flagged_ids' listing the ids you believe are false or deceptive.\n" + info_blob
+            )
+            jresp = await client_ai.chat.completions.create(
+                model=OPENAI_CHAT_MODEL,
+                messages=[{"role": "system", "content": "Judge misinformation succinctly."}, {"role": "user", "content": judge_prompt}],
+                temperature=0,
+                max_tokens=150,
+            )
+            content = jresp.choices[0].message.content or "{}"
+            parsed = parse_json_relaxed(content)
+            if isinstance(parsed, dict):
+                flagged_ids = [str(x) for x in (parsed.get("flagged_ids") or [])]
+                deception_detected = bool(flagged_ids)
+        except Exception as e:
+            logging.getLogger(__name__).warning(f"misinfo judge error: {e}")
+
     vector: List[float] = []
     try:
         client_ai = get_openai_client()
@@ -274,7 +320,7 @@ async def create_reflection(payload: ReflectionCreate):
         logging.getLogger(__name__).warning(f"Embedding generation failed: {e}")
         vector = fallback_embed(text)
 
-    ref = Reflection(project_id=payload.project_id, text=text, vector=vector)
+    ref = Reflection(project_id=payload.project_id, text=text, vector=vector, flagged_false_ids=flagged_ids, deception_detected=deception_detected)
     doc = await serialize_dt(ref.model_dump())
     await db.reflections.insert_one({**doc, "_id": ref.id})
     return ref
@@ -319,15 +365,14 @@ async def list_anomalies(project_id: Optional[str] = Query(default=None)):
 
 # ----- Ticker and price data with CG Demo/Pro + Binance fallback -----
 DATA_SOURCE = os.environ.get('DATA_SOURCE', 'coingecko')  # coingecko | binance | coingecko-only
-CG_PRO_KEY = os.environ.get('COINGECKO_API_KEY')  # Pro plan key (header: x-cg-pro-api-key)
-CG_DEMO_KEY = os.environ.get('COINGECKO_DEMO_API_KEY')  # Demo plan key (header: x-cg-demo-api-key)
+CG_PRO_KEY = os.environ.get('COINGECKO_API_KEY')  # Pro plan key
+CG_DEMO_KEY = os.environ.get('COINGECKO_DEMO_API_KEY')  # Demo plan key
 _last_candle_ts: Optional[int] = None
 _ingest_backoff: int = 60
 
 async def fetch_latest_candle_coingecko() -> bool:
     import httpx
     try:
-        # Prefer Demo if provided (public root), else Pro (pro root), else public no-key
         base = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart"
         headers = {}
         params = {"vs_currency": "usd", "days": "1", "interval": "minute"}
@@ -336,7 +381,6 @@ async def fetch_latest_candle_coingecko() -> bool:
             headers["x-cg-pro-api-key"] = CG_PRO_KEY
         elif CG_DEMO_KEY:
             headers["x-cg-demo-api-key"] = CG_DEMO_KEY
-            # Also include query param variant to satisfy some gateways
             params["x_cg_demo_api_key"] = CG_DEMO_KEY
         async with httpx.AsyncClient(timeout=20) as hc:
             r = await hc.get(base, params=params, headers=headers)
@@ -542,6 +586,61 @@ async def predictions_run():
     result = await predict_once()
     return result
 
+# ----- Opponent simulator & misinfo injection -----
+OPPONENT_PERSONAS = ['honest','bluffer','chaotic']
+MISINFO_TEMPLATES = [
+    "BREAKING: BTC supply doubled overnight due to chain bug",
+    "Leaked memo: Major exchange halting BTC withdrawals indefinitely",
+    "Analyst claims BTC fair value is $0 per IMF report",
+]
+
+@api.post("/opponent/predictions")
+async def opponent_predict(persona: Literal['honest','bluffer','chaotic'] = 'honest', horizon: PredictionHorizon = '1h'):
+    # Need last 60 closes
+    cutoff = int(datetime.now(timezone.utc).timestamp()) - 60 * 60
+    candles = await db.price_candles.find({"ts": {"$gte": cutoff}}, {"_id": 0}).sort("ts", 1).to_list(200)
+    if not candles:
+        raise HTTPException(status_code=400, detail="No candles to compute opponent prediction")
+    closes = [c['close'] for c in candles[-60:]]
+    dir_map = {"lower": 0, "same": 1, "higher": 2}
+
+    def simple_momentum(seq):
+        if len(seq) < 2:
+            return "same"
+        return "higher" if seq[-1] > seq[0] else ("lower" if seq[-1] < seq[0] else "same")
+
+    if persona == 'honest':
+        d = simple_momentum(closes)
+        rationale = "Momentum-based call from last 60m trend"
+    elif persona == 'bluffer':
+        d = random.choice(["higher","lower"])  # avoids 'same'
+        rationale = "Confident call without evidence"
+    else:  # chaotic
+        d = random.choice(["higher","lower","same"])  # random
+        rationale = "Chaotic random direction"
+
+    now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    mins = dict(HORIZONS)[horizon]
+    target_ts = int(now.timestamp()) + mins * 60
+
+    op = OpponentPrediction(persona=persona, horizon=horizon, target_ts=target_ts, direction=dir_map[d], rationale=rationale)
+    dumped = await serialize_dt(op.model_dump())
+    await db.opponent_predictions.insert_one({**dumped, "_id": op.id})
+    return op
+
+@api.post("/misinfo/inject", response_model=Misinfo)
+async def misinfo_inject(headline: Optional[str] = None, source: str = "tweet"):
+    hl = headline or random.choice(MISINFO_TEMPLATES)
+    mi = Misinfo(headline=hl, source=source)
+    dumped = await serialize_dt(mi.model_dump())
+    await db.misinfo_events.insert_one({**dumped, "_id": mi.id})
+    return mi
+
+@api.get("/misinfo/latest")
+async def misinfo_latest(limit: int = Query(default=5, ge=1, le=20)):
+    items = await db.misinfo_events.find({}, {"_id": 0}).sort("created_at", -1).limit(limit).to_list(length=limit)
+    return items
+
 # ----- Graph endpoint (for D3 force-graph) -----
 @api.get("/graph")
 async def graph_data():
@@ -549,6 +648,7 @@ async def graph_data():
     reflections = await db.reflections.find({}, {"_id": 0}).to_list(5000)
     anomalies = await db.anomalies.find({}, {"_id": 0}).to_list(5000)
     latest_preds = await predictions_latest()
+    misinfos = await db.misinfo_events.find({}, {"_id": 0}).sort("created_at", -1).limit(20).to_list(length=20)
 
     nodes = []
     links = []
@@ -592,14 +692,24 @@ async def graph_data():
         if proj:
             links.append({"source": proj["id"], "target": pid, "kind": "has_prediction", "weight": 1})
 
+    # Misinfo nodes and linkage to reflections (flagged vs seen)
+    for m in misinfos:
+        nodes.append({"id": m["id"], "type": "misinfo", "label": m.get("headline", "misinfo")})
+        for r in reflections:
+            # If reflection is recent (within 3h), we consider it saw the misinfo
+            if abs((datetime.fromisoformat(r["created_at"]) - datetime.fromisoformat(m["created_at"]).astimezone(timezone.utc)).total_seconds()) <= 3*3600:
+                flagged = m["id"] in (r.get("flagged_false_ids") or [])
+                links.append({"source": m["id"], "target": r["id"], "kind": "misinfo_context", "weight": 1, "flagged": flagged})
+
     score = max(0, len(reflections) * 2 - len(anomalies))
 
     return {"nodes": nodes, "links": links, "stats": {"score": score, "projects": len(projects), "reflections": len(reflections), "anomalies": len(anomalies)}}
 
-# ----- Reflection scheduler + ingest + predictions scheduling -----
+# ----- Reflection scheduler + ingest + predictions scheduling + misinfo cron -----
 SCHEDULE_HOURS = float(os.environ.get('REFLECTION_SCHEDULE_HOURS', '4'))
 SCHED_NEXT: Optional[str] = None
 PRED_NEXT: Optional[str] = None
+MISINFO_NEXT: Optional[str] = None
 
 async def _auto_reflect_once():
     global SCHED_NEXT
@@ -633,21 +743,36 @@ async def _schedule_predictions():
         except Exception as e:
             logging.getLogger(__name__).warning(f"predict loop error: {e}")
 
+async def _schedule_misinfo():
+    global MISINFO_NEXT
+    while True:
+        now = datetime.now(timezone.utc)
+        next_time = now + timedelta(hours=2)
+        MISINFO_NEXT = next_time.isoformat()
+        await asyncio.sleep((next_time - now).total_seconds())
+        try:
+            await misinfo_inject()
+        except Exception as e:
+            logging.getLogger(__name__).warning(f"misinfo inject error: {e}")
+
 @api.get("/scheduler/status")
 async def scheduler_status():
-    return {"next_reflection": SCHED_NEXT, "next_prediction": PRED_NEXT}
+    return {"next_reflection": SCHED_NEXT, "next_prediction": PRED_NEXT, "next_misinfo": MISINFO_NEXT}
 
 @app.on_event("startup")
 async def startup_tasks():
     try:
         await db.price_candles.create_index("ts", unique=True)
         await db.predictions.create_index([("horizon", 1), ("created_at", -1)])
+        await db.opponent_predictions.create_index([("persona", 1), ("created_at", -1)])
+        await db.misinfo_events.create_index("created_at")
     except Exception as e:
         logging.getLogger(__name__).warning(f"index create error: {e}")
 
     try:
         asyncio.create_task(_tick_ingest())
         asyncio.create_task(_schedule_predictions())
+        asyncio.create_task(_schedule_misinfo())
         global SCHED_NEXT
         SCHED_NEXT = (datetime.now(timezone.utc) + timedelta(seconds=10)).isoformat()
     except Exception as e:
