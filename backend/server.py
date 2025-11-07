@@ -84,6 +84,10 @@ class ImageRequest(BaseModel):
 class ImageResponse(BaseModel):
     url: str
 
+class AIHealth(BaseModel):
+    ok: bool
+    reason: Optional[str] = None
+
 # ----- OpenAI (via Emergent LLM key from env) -----
 OPENAI_KEY = os.environ.get('OPENAI_API_KEY')
 OPENAI_CHAT_MODEL = os.environ.get('OPENAI_CHAT_MODEL', 'gpt-4o-mini')
@@ -215,23 +219,23 @@ async def create_reflection(payload: ReflectionCreate):
                 max_tokens=200,
             )
             text = completion.choices[0].message.content or ""
-        except Exception as e:
+        except Exception:
             # Fallback to a deterministic reflection if AI is unavailable (e.g., missing key or network)
             text = f"Auto-reflection (fallback): Based on the prompt, focus on reducing overfitting, validating signals against multiple timeframes, and weighting volume/volatility to avoid chasing noise. Prompt: {payload.prompt[:180]}"
 
     # Generate embedding for text
     vector: List[float] = []
     try:
-      client_ai = get_openai_client()
-      emb = await client_ai.embeddings.create(
-          model=OPENAI_EMBED_MODEL,
-          input=text,
-          encoding_format="float",
-      )
-      vector = emb.data[0].embedding  # type: ignore
+        client_ai = get_openai_client()
+        emb = await client_ai.embeddings.create(
+            model=OPENAI_EMBED_MODEL,
+            input=text,
+            encoding_format="float",
+        )
+        vector = emb.data[0].embedding  # type: ignore
     except Exception as e:
-      logging.getLogger(__name__).warning(f"Embedding generation failed: {e}")
-      vector = fallback_embed(text)
+        logging.getLogger(__name__).warning(f"Embedding generation failed: {e}")
+        vector = fallback_embed(text)
 
     ref = Reflection(project_id=payload.project_id, text=text, vector=vector)
     doc = await serialize_dt(ref.model_dump())
@@ -282,7 +286,6 @@ async def compute_clusters(k: int = Query(default=4, ge=2, le=12)):
     # lazy import sklearn
     try:
         from sklearn.cluster import KMeans  # type: ignore
-        import numpy as np  # type: ignore
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Missing dependencies for clustering: {e}")
 
@@ -307,12 +310,8 @@ async def compute_clusters(k: int = Query(default=4, ge=2, le=12)):
         raise HTTPException(status_code=500, detail=f"Clustering failed: {e}")
 
     # persist cluster on reflection docs
-    ops = []
     for rid, lab in zip(ids, labels):
-        ops.append({"filter": {"id": rid}, "update": {"$set": {"cluster": int(lab)}}})
-    # bulk write manually
-    for op in ops:
-        await db.reflections.update_one(op["filter"], op["update"])
+        await db.reflections.update_one({"id": rid}, {"$set": {"cluster": int(lab)}})
 
     return {"assigned": len(ids), "clusters": int(k)}
 
@@ -320,7 +319,6 @@ async def compute_clusters(k: int = Query(default=4, ge=2, le=12)):
 async def compute_anomalies(contamination: float = Query(default=0.05, gt=0.0, lt=0.5)):
     try:
         from sklearn.ensemble import IsolationForest  # type: ignore
-        import numpy as np  # type: ignore
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Missing dependencies for anomalies: {e}")
 
@@ -401,7 +399,7 @@ async def graph_data():
         })
         links.append({"source": r["project_id"], "target": rid, "kind": "has_reflection"})
         if r.get("cluster") is not None:
-            links.append({"source": rid, "target": f"cluster-{r['cluster']}", "kind": "in_cluster"})
+            links.append({"source": rid, "target": f"cluster-{r['cluster']}", "kind": "in_cluster", "weight": 1})
 
     # Anomalies
     for a in anomalies:
@@ -412,9 +410,9 @@ async def graph_data():
             "label": a.get("severity", "low"),
             "severity": a.get("severity", "low"),
         })
-        links.append({"source": a["project_id"], "target": aid, "kind": "has_anomaly"})
+        links.append({"source": a["project_id"], "target": aid, "kind": "has_anomaly", "weight": 1})
 
-    # Simple score: reflections - anomalies
+    # Simple score: reflections - anomalies (clamped)
     score = max(0, len(reflections) * 2 - len(anomalies))
 
     return {"nodes": nodes, "links": links, "stats": {"score": score, "projects": len(projects), "reflections": len(reflections), "anomalies": len(anomalies)}}
@@ -435,27 +433,52 @@ async def generate_image(payload: ImageRequest):
         logging.getLogger(__name__).warning(f"Image generation failed: {e}")
         return ImageResponse(url="https://placehold.co/512x512/png?text=AI+Image+error")
 
+# ----- AI health -----
+@api.get("/ai/health", response_model=AIHealth)
+async def ai_health():
+    if not OPENAI_KEY:
+        return AIHealth(ok=False, reason="missing_key")
+    try:
+        client_ai = get_openai_client()
+        # cheap call: 1 token embed
+        await client_ai.embeddings.create(model=OPENAI_EMBED_MODEL, input="ok")
+        return AIHealth(ok=True)
+    except Exception as e:
+        msg = str(e).lower()
+        if "401" in msg or "unauthorized" in msg or "invalid_api_key" in msg:
+            return AIHealth(ok=False, reason="unauthorized")
+        return AIHealth(ok=False, reason="error")
+
 # ----- Reflection scheduler (every N hours) -----
 SCHEDULE_HOURS = float(os.environ.get('REFLECTION_SCHEDULE_HOURS', '4'))
+SCHED_NEXT: Optional[str] = None
 
 async def _auto_reflect_once():
+    global SCHED_NEXT
     # choose most recent project or any
     proj = await db.projects.find_one({}, sort=[("created_at", -1)])
-    if not proj:
-        return
-    try:
-        await create_reflection(ReflectionCreate(project_id=proj["id"], prompt="Periodic 4h reflection on current market regime and adjustments."))
-    except Exception as e:
-        logging.getLogger(__name__).warning(f"Scheduled reflection failed: {e}")
+    if proj:
+        try:
+            await create_reflection(ReflectionCreate(project_id=proj["id"], prompt="Periodic 4h reflection on current market regime and adjustments."))
+        except Exception as e:
+            logging.getLogger(__name__).warning(f"Scheduled reflection failed: {e}")
+    # update next time hint
+    SCHED_NEXT = (datetime.now(timezone.utc) + timedelta(hours=SCHEDULE_HOURS)).isoformat()
+
+@api.get("/scheduler/status")
+async def scheduler_status():
+    return {"next_run_at": SCHED_NEXT}
 
 @app.on_event("startup")
 async def startup_tasks():
+    global SCHED_NEXT
     # try to start apscheduler
     try:
         from apscheduler.schedulers.asyncio import AsyncIOScheduler  # type: ignore
         sched = AsyncIOScheduler()
         sched.start()
         next_time = datetime.now(timezone.utc) + timedelta(seconds=10)
+        SCHED_NEXT = next_time.isoformat()
         sched.add_job(_auto_reflect_once, 'interval', hours=SCHEDULE_HOURS, next_run_time=next_time)
         logging.getLogger(__name__).info("Scheduler started for periodic reflections")
     except Exception as e:
