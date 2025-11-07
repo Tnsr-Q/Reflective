@@ -67,6 +67,7 @@ function App() {
 
   // AI Health banner
   const [aiBanner, setAIBanner] = useState(null);
+  const [dataBanner, setDataBanner] = useState(null);
   useEffect(() => {
     (async () => {
       try {
@@ -81,6 +82,17 @@ function App() {
         }
       } catch (e) {
         setAIBanner("AI status check failed. Try again later.");
+      }
+      try {
+        const res2 = await fetch(`${process.env.REACT_APP_BACKEND_URL}/api/data/health`);
+        const d = await res2.json();
+        if (!d.ok) {
+          setDataBanner("Price feed warming up or rate-limited. Using CoinGecko Demo key; will retry.");
+        } else {
+          setDataBanner(null);
+        }
+      } catch (e) {
+        setDataBanner("Price feed status unavailable.");
       }
     })();
   }, []);
