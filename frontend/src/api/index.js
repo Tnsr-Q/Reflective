@@ -46,3 +46,13 @@ export async function fetchGraph() {
   const { data } = await api.get(`/graph`);
   return data;
 }
+
+// Compute
+export async function computeClusters(k = 4) {
+  const { data } = await api.post(`/compute/clusters`, null, { params: { k } });
+  return data;
+}
+export async function computeAnomalies(contamination = 0.05) {
+  const { data } = await api.post(`/compute/anomalies`, null, { params: { contamination } });
+  return data;
+}
