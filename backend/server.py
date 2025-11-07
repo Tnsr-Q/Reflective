@@ -330,7 +330,7 @@ async def fetch_latest_candle_coingecko() -> bool:
         # Prefer Demo if provided (public root), else Pro (pro root), else public no-key
         base = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart"
         headers = {}
-        params = {"vs_currency": "usd", "days": "1", "interval": "minutely"}
+        params = {"vs_currency": "usd", "days": "1", "interval": "minute"}
         if CG_PRO_KEY:
             base = "https://pro-api.coingecko.com/api/v3/coins/bitcoin/market_chart"
             headers["x-cg-pro-api-key"] = CG_PRO_KEY
