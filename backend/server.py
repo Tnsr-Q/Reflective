@@ -327,16 +327,17 @@ _ingest_backoff: int = 60
 async def fetch_latest_candle_coingecko() -> bool:
     import httpx
     try:
-        # Use Public Demo by default if demo key present, else Pro if pro key present, else public no-key
+        # Prefer Demo if provided (public root), else Pro (pro root), else public no-key
         base = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart"
         headers = {}
+        params = {"vs_currency": "usd", "days": "1", "interval": "minutely"}
         if CG_PRO_KEY:
             base = "https://pro-api.coingecko.com/api/v3/coins/bitcoin/market_chart"
             headers["x-cg-pro-api-key"] = CG_PRO_KEY
         elif CG_DEMO_KEY:
-            # Demo key must hit the public root URL with header x-cg-demo-api-key
             headers["x-cg-demo-api-key"] = CG_DEMO_KEY
-        params = {"vs_currency": "usd", "days": "1", "interval": "minutely"}
+            # Also include query param variant to satisfy some gateways
+            params["x_cg_demo_api_key"] = CG_DEMO_KEY
         async with httpx.AsyncClient(timeout=20) as hc:
             r = await hc.get(base, params=params, headers=headers)
             r.raise_for_status()
@@ -361,6 +362,22 @@ async def fetch_latest_candle_coingecko() -> bool:
         return True
     except Exception as e:
         logging.getLogger(__name__).warning(f"ingest coingecko error: {e}")
+        # Fallback to simple price to at least populate ticker
+        try:
+            async with httpx.AsyncClient(timeout=10) as hc:
+                sp = await hc.get("https://api.coingecko.com/api/v3/simple/price", params={"ids": "bitcoin", "vs_currencies": "usd", **({"x_cg_demo_api_key": CG_DEMO_KEY} if CG_DEMO_KEY else {})}, headers=({"x-cg-demo-api-key": CG_DEMO_KEY} if CG_DEMO_KEY else {}))
+                sp.raise_for_status()
+                j = sp.json()
+                price = float(j.get("bitcoin", {}).get("usd") or 0.0)
+                if price > 0:
+                    ts = int(datetime.now(timezone.utc).timestamp())
+                    candle = {"ts": ts, "open": price, "high": price, "low": price, "close": price, "volume": 0.0}
+                    await db.price_candles.update_one({"ts": candle["ts"]}, {"$set": candle}, upsert=True)
+                    global _last_candle_ts
+                    _last_candle_ts = candle["ts"]
+                    return True
+        except Exception as e2:
+            logging.getLogger(__name__).warning(f"simple price fallback failed: {e2}")
         return False
 
 async def fetch_latest_candle_binance() -> bool:
