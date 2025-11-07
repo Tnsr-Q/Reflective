@@ -1,6 +1,8 @@
 import React, { useEffect, useMemo, useState } from "react";
 import "./App.css";
 import Graph from "./components/Graph";
+import PredictionCards from "./components/PredictionCards";
+import Ticker from "./components/Ticker";
 import {
   createProject,
   listProjects,
@@ -11,6 +13,9 @@ import {
   fetchGraph,
   computeClusters,
   computeAnomalies,
+  getTicker,
+  getSchedulerStatus,
+  getLatestPredictions,
 } from "./api/index";
 
 function useGraphData(refreshTick) {
@@ -137,31 +142,26 @@ function App() {
     }
   };
 
-  const handleComputeClusters = async () => {
-    setComputeBusy(true);
-    try {
-      await computeClusters(clustersK);
-      setRefreshTick((x) => x + 1);
-    } catch (e) {
-      // eslint-disable-next-line no-alert
-      alert(e?.response?.data?.detail || e.message || "Cluster compute failed");
-    } finally {
-      setComputeBusy(false);
-    }
-  };
+  // Ticker & predictions
+  const [ticker, setTicker] = useState({ price: null, change24h: null });
+  const [sched, setSched] = useState({ next_reflection: null, next_prediction: null });
+  const [latestPreds, setLatestPreds] = useState([]);
 
-  const handleComputeAnomalies = async () => {
-    setComputeBusy(true);
-    try {
-      await computeAnomalies(contamination);
-      setRefreshTick((x) => x + 1);
-    } catch (e) {
-      // eslint-disable-next-line no-alert
-      alert(e?.response?.data?.detail || e.message || "Anomaly detection failed");
-    } finally {
-      setComputeBusy(false);
-    }
-  };
+  useEffect(() => {
+    let active = true;
+    const load = async () => {
+      try {
+        const [t, s, p] = await Promise.all([getTicker().catch(() => ({})), getSchedulerStatus().catch(() => ({})), getLatestPredictions().catch(() => ([]))]);
+        if (!active) return;
+        setTicker({ price: t?.price ?? null, change24h: t?.change24h ?? null });
+        setSched({ next_reflection: s?.next_reflection ?? null, next_prediction: s?.next_prediction ?? null });
+        setLatestPreds(Array.isArray(p) ? p : []);
+      } catch (e) {}
+    };
+    load();
+    const id = setInterval(load, 15000);
+    return () => { active = false; clearInterval(id); };
+  }, []);
 
   return (
     <div className="App">
@@ -177,6 +177,11 @@ function App() {
       )}
 
       <main className="container" style={{ maxWidth: 1200, margin: "0 auto", padding: 16 }}>
+        <Ticker price={ticker.price} change24h={ticker.change24h} nextPredictionAt={sched.next_prediction} />
+        <div style={{ height: 12 }} />
+        <PredictionCards items={latestPreds} />
+        <div style={{ height: 16 }} />
+
         <div className="grid" style={{ marginBottom: 16 }}>
           <div className="panel" style={{ gridColumn: "span 4" }}>
             <h3>Create Project</h3>
@@ -378,7 +383,7 @@ function SchedulerInfo() {
       try {
         const res = await fetch(`${process.env.REACT_APP_BACKEND_URL}/api/scheduler/status`);
         const j = await res.json();
-        setNextRunAt(j?.next_run_at || null);
+        setNextRunAt(j?.next_reflection || null);
       } catch (e) {
         setNextRunAt(null);
       }
