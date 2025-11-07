@@ -154,6 +154,33 @@ function App() {
     }
   };
 
+  const handleComputeClusters = async () => {
+    setComputeBusy(true);
+    try {
+      await computeClusters(clustersK);
+      setRefreshTick((x) => x + 1);
+    } catch (e) {
+      // eslint-disable-next-line no-alert
+      alert(e?.response?.data?.detail || e.message || "Cluster compute failed");
+    } finally {
+      setComputeBusy(false);
+    }
+  };
+
+  const handleComputeAnomalies = async () => {
+    setComputeBusy(true);
+    try {
+      await computeAnomalies(contamination);
+      setRefreshTick((x) => x + 1);
+    } catch (e) {
+      // eslint-disable-next-line no-alert
+      alert(e?.response?.data?.detail || e.message || "Anomaly detection failed");
+    } finally {
+      setComputeBusy(false);
+    }
+  };
+
+
   // Ticker & predictions
   const [ticker, setTicker] = useState({ price: null, change24h: null });
   const [sched, setSched] = useState({ next_reflection: null, next_prediction: null });
